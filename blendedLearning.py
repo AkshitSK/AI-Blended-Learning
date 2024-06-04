@@ -18,7 +18,7 @@ from fpdf import FPDF
 
 # Load the MBart model and tokenizer for translation
 model = MBartForConditionalGeneration.from_pretrained("facebook/mbart-large-50-many-to-many-mmt")
-tokenizer = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50-many-to-many-mmt", use_fast=False)
+tokenizer = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50-many-to-many-mmt")
 
 # Audio Processor class for real-time audio processing
 # class AudioProcessor(AudioProcessorBase):
