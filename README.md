@@ -1,3 +1,5 @@
+# AI Blended Learning
+
 ### Dependencies
 
 Ensure you have the required dependencies installed. You can install them using pip:
