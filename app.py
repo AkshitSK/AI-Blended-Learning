@@ -6,20 +6,15 @@ import tempfile
 import shutil
 import atexit
 import glob
-from tqdm import tqdm
-from termcolor import colored
 import torch
-from transformers import (
-    MBart50TokenizerFast,
-    pipeline,
-    TRANSFORMERS_CACHE
-)
+from transformers import MBart50TokenizerFast, pipeline, TRANSFORMERS_CACHE
 from sklearn.feature_extraction.text import TfidfVectorizer
 from pydub import AudioSegment
 import whisper
 from moviepy.editor import VideoFileClip
 from fpdf import FPDF
 import concurrent.futures
+import streamlit as st
 
 # Force the use of GTX 1650 CUDA
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Assuming GTX 1650 is the first GPU
@@ -44,13 +39,12 @@ atexit.register(cleanup)
 def setup_device():
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        print(colored(f"Using GPU: {torch.cuda.get_device_name(0)}", "green"))
+        return device, f"Using GPU: {torch.cuda.get_device_name(0)}"
     else:
         device = torch.device("cpu")
-        print(colored("No GPU available. Using CPU.", "yellow"))
-    return device
+        return device, "No GPU available. Using CPU."
 
-device = setup_device()
+device, device_message = setup_device()
 
 def get_model_paths():
     cache_dir = TRANSFORMERS_CACHE
@@ -64,30 +58,29 @@ def get_model_paths():
 def print_downloaded_models():
     model_paths = get_model_paths()
     if model_paths:
-        print(colored("Downloaded models:", "blue"))
-        for path in model_paths:
-            print(f"  - {path}")
+        return ["Downloaded models:"] + model_paths
     else:
-        print(colored("No downloaded models found.", "green"))
+        return ["No downloaded models found."]
 
 def delete_model(model_name):
     cache_dir = TRANSFORMERS_CACHE
     model_dir = os.path.join(cache_dir, model_name.replace("/", "--"))
     if os.path.exists(model_dir):
         shutil.rmtree(model_dir)
-        print(colored(f"Deleted model: {model_name}", "green"))
+        return f"Deleted model: {model_name}"
     else:
-        print(colored(f"Model not found: {model_name}", "yellow"))
+        return f"Model not found: {model_name}"
 
 def delete_all_models():
     model_paths = get_model_paths()
+    messages = []
     if model_paths:
         for path in model_paths:
             try:
                 os.remove(path)
-                print(colored(f"Deleted: {path}", "green"))
+                messages.append(f"Deleted: {path}")
             except:
-                print(colored(f"Failed to delete: {path}", "red"))
+                messages.append(f"Failed to delete: {path}")
         
         # Also remove empty directories
         cache_dir = TRANSFORMERS_CACHE
@@ -98,18 +91,19 @@ def delete_all_models():
                     os.rmdir(dir_path)
                 except:
                     pass
-        print(colored("All models deleted.", "green"))
+        messages.append("All models deleted.")
     else:
-        print(colored("No models to delete.", "yellow"))
+        messages.append("No models to delete.")
+    return messages
 
 def delete_whisper_model():
     home_dir = os.path.expanduser("~")
     whisper_dir = os.path.join(home_dir, ".cache", "whisper")
     if os.path.exists(whisper_dir):
         shutil.rmtree(whisper_dir)
-        print(colored("Deleted Whisper model.", "green"))
+        return "Deleted Whisper model."
     else:
-        print(colored("Whisper model not found.", "yellow"))
+        return "Whisper model not found."
 
 def find_video_file(directory):
     for root, _, files in os.walk(directory):
@@ -119,7 +113,7 @@ def find_video_file(directory):
     return None
 
 def extract_audio_from_video(video_file_path):
-    print(colored("Starting: Extract audio from video", "blue"))
+    st.write("Starting: Extract audio from video")
     video_clip = VideoFileClip(video_file_path)
     audio_clip = video_clip.audio
     temp_audio_path = "temp_audio.wav"
@@ -130,21 +124,19 @@ def extract_audio_from_video(video_file_path):
         temp_files.append(output_audio_file_path)
     audio.export(output_audio_file_path, format="mp3")
     os.remove(temp_audio_path)
-    print(colored("Completed: Extract audio from video", "green"))
+    st.write("Completed: Extract audio from video")
     return output_audio_file_path
 
 def transcribe_chunk(chunk_path, index):
-    print(colored(f"Transcribing chunk {index}", "blue"))
     try:
         model = whisper.load_model("base").to(device)
         result = model.transcribe(chunk_path)
-        return index, result["text"]
+        return index, result["text"], None
     except Exception as e:
-        print(colored(f"Error transcribing chunk {index}: {e}", "red"))
-        return index, ""
+        return index, "", str(e)
 
 def transcribe_audio(audio_file_path, chunk_size=30):  # 30 seconds chunks
-    print(colored("Starting: Transcribe audio", "blue"))
+    st.write("Starting: Transcribe audio")
     audio = AudioSegment.from_file(audio_file_path)
     
     chunks = []
@@ -156,11 +148,15 @@ def transcribe_audio(audio_file_path, chunk_size=30):  # 30 seconds chunks
         chunks.append((temp_chunk_path, i // (chunk_size * 1000)))
 
     transcription_parts = [None] * len(chunks)
+    errors = []
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = [executor.submit(transcribe_chunk, *chunk) for chunk in chunks]
-        for future in tqdm(concurrent.futures.as_completed(futures), total=len(chunks), desc="Transcribing", unit="chunk"):
-            index, text = future.result()
-            transcription_parts[index] = text
+        for future in concurrent.futures.as_completed(futures):
+            index, text, error = future.result()
+            if error:
+                errors.append(f"Error transcribing chunk {index}: {error}")
+            else:
+                transcription_parts[index] = text
             
     for chunk_path, _ in chunks:
         try:
@@ -169,10 +165,7 @@ def transcribe_audio(audio_file_path, chunk_size=30):  # 30 seconds chunks
             pass
 
     transcription = " ".join(filter(None, transcription_parts))
-    print(colored("Completed: Transcribe audio", "green"))
-    print("\nTranscription:")
-    print(transcription)
-    return transcription
+    return transcription, errors
 
 def chunk_text(text, tokenizer, max_length=1024):
     tokens = tokenizer.encode(text)
@@ -183,30 +176,29 @@ def chunk_text(text, tokenizer, max_length=1024):
     return chunks
 
 def analyze_transcript(transcription):
-    print(colored("Starting: Analyze transcript", "blue"))
+    st.write("Starting: Analyze transcript")
     tokenizer = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50-many-to-many-mmt")
     
     # Try to use GPU, but switch to CPU if there's an issue
     try:
         summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=0 if torch.cuda.is_available() else -1)
-        print(colored("Using GPU for summarization", "green"))
+        summary_device_message = "Using GPU for summarization"
     except:
-        print(colored("CUDA error encountered. Switching to CPU.", "yellow"))
+        summary_device_message = "CUDA error encountered. Switching to CPU."
         summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=-1)
+
+    st.write(summary_device_message)
 
     # Generate a comprehensive summary
     transcription_chunks = chunk_text(transcription, tokenizer, max_length=512)  # Smaller chunks for summarization too
     full_summary = ""
     for i, chunk in enumerate(transcription_chunks):
-        print(colored(f"Summarizing chunk {i+1}/{len(transcription_chunks)}", "blue"))
         if len(chunk.split()) > 10:  # Only summarize if chunk is not too short
             try:
                 summary_result = summarizer(chunk, do_sample=False, min_length=50, max_length=150)
                 full_summary += " " + summary_result[0]['summary_text']
             except:
-                print(colored(f"Error summarizing chunk {i+1}. Skipping.", "yellow"))
-
-    print(colored("Generated full summary. Now extracting key points...", "green"))
+                pass
 
     # Function to preprocess text
     def preprocess(text):
@@ -230,7 +222,7 @@ def analyze_transcript(transcription):
     top_indices = heapq.nlargest(num_key_points, range(len(scores)), key=lambda i: scores[i])
     key_points = [f"{i+1}. {sentences[idx]}" for i, idx in enumerate(sorted(top_indices))]
 
-    print(colored("Completed: Analyze transcript", "green"))
+    st.write("Completed: Analyze transcript")
 
     # Save key points and full summary to PDF
     pdf = FPDF()
@@ -252,30 +244,60 @@ def analyze_transcript(transcription):
 
     pdf_output_path = "transcript_analysis.pdf"
     pdf.output(pdf_output_path)
-    print(colored(f"Comprehensive analysis has been saved to: {pdf_output_path}", "green"))
+    return full_summary, key_points, pdf_output_path
 
 def main():
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    video_file = find_video_file(current_dir)
+    st.title("Video Transcription and Analysis")
+
+    with st.sidebar.expander("Options"):
+        st.write("Configure your options here.")
+        video_file = st.file_uploader("Upload Video File", type=["mp4", "mov", "avi"])
+        delete_models = st.checkbox("Delete Models after Analysis", value=True)
     
-    if video_file:
-        print(colored(f"Found video file: {video_file}", "green"))
-        audio_file = extract_audio_from_video(video_file)
-        transcription = transcribe_audio(audio_file)
-        analyze_transcript(transcription)
+    if st.button("Start Analysis"):
+        if video_file is not None:
+            with st.spinner("Processing..."):
+                temp_video_path = os.path.join(tempfile.gettempdir(), video_file.name)
+                with open(temp_video_path, "wb") as f:
+                    f.write(video_file.getbuffer())
+                
+                st.write(f"Uploaded video file: {video_file.name}")
+                audio_file = extract_audio_from_video(temp_video_path)
 
-        # After analysis, print and delete models
-        print("\n" + "="*50)
-        print_downloaded_models()
-        print("="*50 + "\n")
+                transcription, transcription_errors = transcribe_audio(audio_file)
+                st.write("Completed: Transcribe audio")
+                st.write("Transcription:")
+                st.write(transcription)
+                if transcription_errors:
+                    st.write("Errors during transcription:")
+                    for error in transcription_errors:
+                        st.write(error)
 
-        print("Deleting models...")
-        delete_model("facebook/mbart-large-50-many-to-many-mmt")
-        delete_model("facebook/bart-large-cnn")
-        delete_whisper_model()
-        print("Model cleanup completed.")
-    else:
-        print(colored("No video file found in the directory.", "red"))
+                full_summary, key_points, pdf_output_path = analyze_transcript(transcription)
+
+                st.write("Full Summary:")
+                st.write(full_summary)
+
+                st.write("Key Points:")
+                for key_point in key_points:
+                    st.write(key_point)
+
+                st.write(f"Comprehensive analysis has been saved to: {pdf_output_path}")
+
+                if delete_models:
+                    st.write("\n" + "="*50)
+                    model_paths = print_downloaded_models()
+                    for path in model_paths:
+                        st.write(path)
+                    st.write("="*50 + "\n")
+
+                    st.write("Deleting models...")
+                    st.write(delete_model("facebook/mbart-large-50-many-to-many-mmt"))
+                    st.write(delete_model("facebook/bart-large-cnn"))
+                    st.write(delete_whisper_model())
+                    st.write("Model cleanup completed.")
+        else:
+            st.warning("Please upload a video file.")
 
 if __name__ == "__main__":
     try:
